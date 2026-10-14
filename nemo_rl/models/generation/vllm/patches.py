@@ -1199,6 +1199,7 @@ def ensure_vllm_source_compat() -> None:
     from vllm.logger import init_logger
 
     patch_logger = init_logger("vllm_patch")
+    _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
