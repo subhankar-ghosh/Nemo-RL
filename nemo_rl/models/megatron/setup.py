@@ -1110,6 +1110,18 @@ def setup_model_config(
     if derive_provider_from_hf or model_overrides:
         model_cfg.finalize()
 
+    # LOCAL PATCH (S3.15): a megatron_bridge checkpoint's run_config.yaml serialises these as
+    # UNBOUND DistributedDataParallel methods; Bridge re-binds them itself only if they are None.
+    _nulled = [
+        _f
+        for _f in ("no_sync_func", "grad_sync_func", "param_sync_func")
+        if getattr(model_cfg, _f, None) is not None
+    ]
+    for _f in _nulled:
+        setattr(model_cfg, _f, None)
+    # Unconditional breadcrumb: absent telemetry must not read as "the patch ran". S3.16.
+    print(f"[LOCAL PATCH S3.15] rank={rank} nulled_sync_handles={_nulled}", flush=True)
+
     model_cfg.__post_init__()
 
     # Derive fp8_param_enabled once from the config dict so that load_main_params_from_ckpt

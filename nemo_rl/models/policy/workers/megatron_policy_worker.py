@@ -3131,6 +3131,13 @@ class MegatronPolicyWorkerImpl(
             # under the "mtp/" namespace so it logs as train/mtp/grad_norm.
             if mtp_grad_norm is not None:
                 mtp_metrics["grad_norm"] = float(mtp_grad_norm)
+            # LOCAL PATCH: mtp_*_loss is RAW. Emit the EFFECTIVE scaling factor from the live
+            # model config -- the value the loss actually used, never a default. See S3.28.
+            _eff_scale = getattr(
+                self._get_model_config(), "mtp_loss_scaling_factor", None
+            )
+            if _eff_scale is not None:
+                mtp_metrics["loss_scaling_factor"] = float(_eff_scale)
             if mtp_metrics:
                 metrics["mtp_metrics"] = mtp_metrics
 

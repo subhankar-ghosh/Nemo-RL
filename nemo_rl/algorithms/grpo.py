@@ -2625,6 +2625,154 @@ def _trajectory_group_ids(trajectories: list[dict[str, Any]]) -> torch.Tensor:
     )
 
 
+def _mtp_effective_scale(mtp_metrics: dict) -> Optional[float]:
+    """LOCAL PATCH: the EFFECTIVE mtp_loss_scaling_factor, emitted by the worker from the live
+    model config. Returns None if absent -- never guess a default. See status S3.28.
+    """
+    s = (mtp_metrics or {}).get("loss_scaling_factor")
+    if s is None:
+        return None
+    return float(s.numpy().mean()) if hasattr(s, "numpy") else float(s)
+
+
+def _mtp_scaled_metrics(train_results, master_config: Any) -> dict[str, Any]:
+    """LOCAL PATCH: mtp_1_loss is logged RAW, so |policy|/mtp_raw is scaling-independent and
+    cannot respond to mtp_loss_scaling_factor. Log the scaled form too. See status S3.27 / S3.28.
+    """
+    out: dict[str, Any] = {}
+    try:
+        mtp = train_results.get("mtp_metrics") or {}
+        m1 = mtp.get("mtp_1_loss")
+        if m1 is None:
+            return out
+        m1 = float(m1.numpy().mean()) if hasattr(m1, "numpy") else float(m1)
+        # Read, never default: mcore says 0.1 (transformer_config.py:75) but nemotron_h_bridge.py:330
+        # sets 0.3, and a checkpoint restore carries its own value. A guess here is what caused the
+        # original artefact. No effective scale reported -> emit nothing rather than a wrong number.
+        scale = _mtp_effective_scale(mtp)
+        if scale is None:
+            return out
+        scaled = scale * m1
+        out["mtp/mtp_1_loss_scaled"] = scaled
+        # Logged so the scale in force is auditable from the run's own metrics.
+        out["mtp/mtp_loss_scaling_factor"] = scale
+        pl = train_results["loss"]
+        pl = float(pl.numpy().mean()) if hasattr(pl, "numpy") else float(pl)
+        # nan, not a crash, when MTP is disabled (scale 0) or the raw loss is 0.
+        out["mtp/policy_over_scaled_mtp"] = (
+            abs(pl) / abs(scaled) if scaled else float("nan")
+        )
+    except Exception as e:  # instrumentation must never kill a training step
+        print(f"[LEARN-DEBUG] mtp scaled-metric failed: {e}", flush=True)
+    return out
+
+
+from nemo_rl.algorithms.truncation_abort import apply_truncation_abort_clamp
+
+
+def _clamp_overlong_sequences(
+    repeated_batch: BatchedDataDict[DatumSpec],
+    bin_capacity: int,
+    round_to: int = 1,
+) -> tuple[int, list[int]]:
+    """LOCAL PATCH: zero-weight AND truncate rows longer than the packer bin. See status S3.24.
+
+    Detects by ACTUAL length, not the `truncated` flag -- `truncated` only means "this generation
+    hit max_new_tokens" and never fires for overflow accumulated across many short turns, the
+    dominant mode at high max_steps. Clamps rather than drops: a dropped row would corrupt the
+    GRPO leave-one-out baseline and the fixed group size.
+    """
+    # make_sequence_length_divisible_by rounds UP after this point, so an exact clamp to
+    # bin_capacity still overflows by up to round_to-1 tokens.
+    target = bin_capacity - max(round_to, 1)
+    logs = repeated_batch["message_log"]
+    loss_multiplier = repeated_batch["loss_multiplier"].clone()
+    clamped: list[int] = []
+    for i, row in enumerate(logs):
+        total = sum(
+            int(m["token_ids"].shape[-1]) for m in row if "token_ids" in m
+        )
+        if total <= target:
+            continue
+        clamped.append(i)
+        # Do NOT assume the row was already zero-weighted: overlong_filtering never flagged it.
+        loss_multiplier[i] = 0
+        excess = total - target
+        for m in reversed(row):  # trim from the tail
+            if excess <= 0:
+                break
+            if "token_ids" not in m:
+                continue
+            length = int(m["token_ids"].shape[-1])
+            keep = max(0, length - excess)
+            excess -= length - keep
+            # Trim EVERY same-length tensor, not just token_ids, so per-token side tensors
+            # (generation logprobs, masks) stay aligned.
+            for k, v in list(m.items()):
+                if torch.is_tensor(v) and v.shape[-1:] == torch.Size([length]):
+                    m[k] = v[..., :keep]
+    repeated_batch["loss_multiplier"] = loss_multiplier
+    return len(clamped), clamped
+
+
+def _overlong_clamp_metrics(
+    repeated_batch: BatchedDataDict[DatumSpec], master_config: Any
+) -> dict[str, Any]:
+    """LOCAL PATCH: run the clamp and return its metrics. Called at both sites. See S3.24."""
+    policy_cfg = master_config.policy
+    # Both packer bins are max_total_sequence_length x their batch size; take the smaller.
+    per_bin = min(
+        int(policy_cfg["logprob_batch_size"]), int(policy_cfg["train_micro_batch_size"])
+    )
+    bin_cap = int(policy_cfg["max_total_sequence_length"]) * per_bin
+    round_to = int(policy_cfg["make_sequence_length_divisible_by"])
+    num_clamped, clamped_idx = _clamp_overlong_sequences(
+        repeated_batch, bin_cap, round_to
+    )
+    n_rows = len(repeated_batch["message_log"])
+    group_size = int(master_config.grpo.num_generations_per_prompt)
+    out: dict[str, Any] = {
+        "num_overlong_clamped": num_clamped,
+        "overlong_clamp_rate": (num_clamped / n_rows) if n_rows else 0.0,
+        # Concentration matters: clamping bunched into a few groups silently shrinks effective
+        # group size and biases the leave-one-out baseline where the longest trajectories live.
+        "overlong_clamped_groups": len({i // group_size for i in clamped_idx}),
+    }
+    # The logged baseline_reward/pct_mixed is computed BEFORE the clamp, so clamp-induced loss of
+    # contrast is invisible there. Clamping selects on length and wrong rollouts are ~4x longer,
+    # so it preferentially zeroes WRONG rows -- leaving a group uniformly correct is as dead for
+    # GRPO as uniformly wrong. These three make that observable. See status S3.25.
+    # Agent-side truncation aborts clamp identically; fold them into the dead-row mask so
+    # effective_pct_mixed reflects BOTH mechanisms. Their own counters stay separate.
+    abort_idx, abort_metrics = apply_truncation_abort_clamp(repeated_batch, group_size)
+    out.update(abort_metrics)
+    rew = repeated_batch["total_reward"]
+    if not torch.is_tensor(rew):
+        rew = torch.as_tensor(rew)
+    rew = rew.detach().float().reshape(-1)
+    if rew.numel() == n_rows and n_rows:
+        mask = torch.zeros(n_rows, dtype=torch.bool)
+        if clamped_idx:
+            mask[torch.as_tensor(clamped_idx, dtype=torch.long)] = True
+        dead = mask.clone()
+        if abort_idx:
+            dead[torch.as_tensor(abort_idx, dtype=torch.long)] = True
+        out["overlong_clamped_reward_mean"] = (
+            rew[mask].mean().item() if bool(mask.any()) else float("nan")
+        )
+        out["overlong_unclamped_reward_mean"] = (
+            rew[~mask].mean().item() if bool((~mask).any()) else float("nan")
+        )
+        # Per group, over ONLY the rows that still carry weight.
+        mixed = []
+        for g in range(n_rows // group_size):
+            s = slice(g * group_size, (g + 1) * group_size)
+            kept = rew[s][~dead[s]]
+            mixed.append(0 < kept.sum().item() < kept.numel())
+        out["effective_pct_mixed"] = 100 * sum(mixed) / max(len(mixed), 1)
+    return out
+
+
 def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int:
     """Zero loss_multiplier where mask_sample is True and return the count."""
     if "mask_sample" not in repeated_batch:
@@ -2827,7 +2975,11 @@ def refit_policy_generation(
 
     if colocated_inference:
         policy.offload_before_refit()
-        policy_generation.prepare_for_generation(tags=["weights"])
+        if policy_generation.prepare_for_generation(tags=["weights"]) is False:
+            raise RuntimeError(
+                "prepare_for_generation(tags=['weights']) FAILED during refit; "
+                "aborting loudly rather than hanging."
+            )
 
     # Create a context manager that does nothing when timer is None
     timer_context = (
@@ -2886,7 +3038,11 @@ def refit_policy_generation(
 
     if colocated_inference:
         policy.offload_after_refit()
-        policy_generation.prepare_for_generation(tags=["kv_cache"])
+        if policy_generation.prepare_for_generation(tags=["kv_cache"]) is False:
+            raise RuntimeError(
+                "prepare_for_generation(tags=['kv_cache']) FAILED during refit; "
+                "aborting loudly rather than hanging."
+            )
 
     return {}
 
@@ -3692,6 +3848,12 @@ def _grpo_train_impl(
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
 
+                    # LOCAL PATCH: overlong_filtering only zero-weights; the row still reaches the
+                    # packer and aborts the step. Clamp it too. See status S3.24.
+                    metrics.update(
+                        _overlong_clamp_metrics(repeated_batch, master_config)
+                    )
+
                     num_mask_sample_filtered = _apply_mask_sample_filter(repeated_batch)
                     metrics["num_mask_sample_filtered"] = num_mask_sample_filtered
 
@@ -4037,6 +4199,10 @@ def _grpo_train_impl(
                 if "mtp_metrics" in train_results:
                     metrics.update(
                         {f"mtp/{k}": v for k, v in train_results["mtp_metrics"].items()}
+                    )
+                    # Raw kept for MTP's own convergence; scaled is what balance depends on. S3.27.
+                    metrics.update(
+                        _mtp_scaled_metrics(train_results, master_config)
                     )
                 if "draft_grad_norm" in train_results:
                     metrics["draft_grad_norm"] = train_results[
@@ -5512,6 +5678,9 @@ def async_grpo_train(
                         f"  📊 Rewards stats: min={rewards.min():.4f}, max={rewards.max():.4f}, mean={rewards.mean():.4f}, std={rewards.std():.4f}"
                     )
 
+                # LOCAL FIX 2026-10-15: the overlong clamp below writes to `metrics`, which this
+                # async loop never created (job 20302290: UnboundLocalError).
+                metrics: dict[str, Any] = {}
                 # Prepare training data (same as sync version)
                 with (
                     timer.time("data_processing"),
@@ -5533,6 +5702,13 @@ def async_grpo_train(
 
                             loss_multiplier[truncated] = 0
                             repeated_batch["loss_multiplier"] = loss_multiplier
+
+                        # LOCAL PATCH: overlong_filtering only zero-weights; the row still reaches
+                        # the packer and aborts the step. Clamp it too. This is the LIVE path for
+                        # this config -- patching only the sync site is a no-op. See status S3.24.
+                        metrics.update(
+                            _overlong_clamp_metrics(repeated_batch, master_config)
+                        )
 
                     with timer.time("mask_sample_filter"):
                         num_mask_sample_filtered = _apply_mask_sample_filter(
@@ -5930,6 +6106,9 @@ def async_grpo_train(
                 )
 
                 metrics = {
+                    # LOCAL FIX 2026-10-15: keep the overlong-clamp / truncation-abort metrics
+                    # gathered earlier this step; the sync path does the same.
+                    **metrics,
                     LOSS_KEY: train_results["loss"].numpy(),
                     REWARD_KEY: rewards.numpy(),
                     "num_mask_sample_filtered": num_mask_sample_filtered,
@@ -5954,6 +6133,10 @@ def async_grpo_train(
                 if "mtp_metrics" in train_results:
                     metrics.update(
                         {f"mtp/{k}": v for k, v in train_results["mtp_metrics"].items()}
+                    )
+                    # Raw kept for MTP's own convergence; scaled is what balance depends on. S3.27.
+                    metrics.update(
+                        _mtp_scaled_metrics(train_results, master_config)
                     )
                 if "draft_grad_norm" in train_results:
                     metrics["draft_grad_norm"] = train_results[

@@ -1381,8 +1381,8 @@ class VllmGeneration(GenerationInterface):
             results = ray.get(futures)
             return all(result for result in results if result is not None)
         except Exception as e:
-            print(f"Error during policy preparation: {e}")
-            return False
+            print(f"Error during policy preparation: {e}", flush=True)
+            raise RuntimeError(f"Error during policy preparation: {e}") from e
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Sleep workers and reset prefix cache."""

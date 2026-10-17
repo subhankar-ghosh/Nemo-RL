@@ -39,6 +39,7 @@ from nemo_rl.data.interfaces import (
     LLMMessageLogType,
     VLMMessageLogType,
 )
+from nemo_rl.algorithms.truncation_abort import truncation_abort_columns
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
@@ -365,6 +366,15 @@ def _mask_sample_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
         return bool((extra.get("instance_config") or {}).get(MASK_SAMPLE, False))
 
     return torch.tensor([flagged(extra) for extra in extras], dtype=torch.bool)
+
+
+def _extract_truncation_abort_columns(
+    results: list[dict[str, Any]],
+) -> dict[str, torch.Tensor]:
+    """Carry the agent's ``_ng_truncation`` abort record into batch columns. See S3.26."""
+    return truncation_abort_columns(
+        [result["full_result"].get("_ng_truncation") for result in results]
+    )
 
 
 def _attach_routed_experts_to_message_log_prefix(
@@ -3300,6 +3310,9 @@ def _postprocess_single_nemo_gym_group(
             resolved_reward_penalty_config,
         )
     )
+
+    # Agent-side truncation aborts; clamped (not dropped) in grpo._overlong_clamp_metrics.
+    final_batch.update(_extract_truncation_abort_columns(results))
 
     # Expose per-component rewards as `reward/<name>` batch keys for multi-reward NeMo
     # Gym environments so GDPO can compute per-component advantages; single-reward envs

@@ -888,6 +888,12 @@ if [[ "$DEDICATED_RAY_HEAD" == "1" ]]; then
   echo "[INFO] Dedicated Ray head enabled: advertising zero GPUs and no worker_units"
 fi
 
+# LOCAL PATCH: opt-in venv override. If NRL_VENV_BIN is set (expanded at generation time),
+# put it first on PATH for the Ray head AND every worker; both must match.
+if [[ -n "${NRL_VENV_BIN:-}" ]]; then
+  export PATH="${NRL_VENV_BIN}:\$PATH"
+  echo "[INFO] NRL_VENV_BIN active on \$(hostname): ray=\$(command -v ray) python=\$(command -v python3)"
+fi
 # Start the head without --block. 'ray start --head' then returns as soon as the
 # GCS is listening, so we touch STARTED_RAY_HEAD only after the head is actually up.
 # Workers gate on that file, so they only try to connect once the GCS is accepting
@@ -1086,6 +1092,12 @@ sed -i 's/context\.py_executable = " "\.join(self\.nsight_cmd) + " python"/conte
 
 source $LOG_DIR/topology_probe.sh
 
+# LOCAL PATCH: opt-in venv override. If NRL_VENV_BIN is set (expanded at generation time),
+# put it first on PATH for the Ray head AND every worker; both must match.
+if [[ -n "${NRL_VENV_BIN:-}" ]]; then
+  export PATH="${NRL_VENV_BIN}:\$PATH"
+  echo "[INFO] NRL_VENV_BIN active on \$(hostname): ray=\$(command -v ray) python=\$(command -v python3)"
+fi
 # Wait for the head to signal that its GCS is listening before connecting.
 echo "[INFO] Worker \$SLURM_PROCID: waiting for Ray head GCS to be ready..."
 while true; do
