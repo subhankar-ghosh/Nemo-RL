@@ -891,7 +891,7 @@ fi
 # LOCAL PATCH: opt-in venv override. If NRL_VENV_BIN is set (expanded at generation time),
 # put it first on PATH for the Ray head AND every worker; both must match.
 if [[ -n "${NRL_VENV_BIN:-}" ]]; then
-  export PATH="${NRL_VENV_BIN}:\$PATH"
+  export PATH="${NRL_VENV_BIN:-}:\$PATH"
   echo "[INFO] NRL_VENV_BIN active on \$(hostname): ray=\$(command -v ray) python=\$(command -v python3)"
 fi
 # Start the head without --block. 'ray start --head' then returns as soon as the
@@ -1095,7 +1095,7 @@ source $LOG_DIR/topology_probe.sh
 # LOCAL PATCH: opt-in venv override. If NRL_VENV_BIN is set (expanded at generation time),
 # put it first on PATH for the Ray head AND every worker; both must match.
 if [[ -n "${NRL_VENV_BIN:-}" ]]; then
-  export PATH="${NRL_VENV_BIN}:\$PATH"
+  export PATH="${NRL_VENV_BIN:-}:\$PATH"
   echo "[INFO] NRL_VENV_BIN active on \$(hostname): ray=\$(command -v ray) python=\$(command -v python3)"
 fi
 # Wait for the head to signal that its GCS is listening before connecting.
