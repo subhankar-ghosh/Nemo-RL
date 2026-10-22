@@ -470,6 +470,18 @@ class WatchdogConfig(BaseModel, extra="allow"):
         return self
 
 
+class FirstStepPartialConfig(BaseModel, extra="forbid"):
+    """Let the first optimizer step after process start close on fewer groups.
+
+    That step waits for the slowest rollout of every group while the trainer idles.
+    """
+
+    # Seconds after the step began before it may close short; None disables it.
+    timeout_s: Optional[PositiveFloat] = None
+    # Fewest trained prompt groups the short step may close on.
+    min_groups: PositiveInt = 8
+
+
 class AsyncRLConfig(BaseModel, extra="allow"):
     # Stream every consumed sample's untruncated token tensors to JSONL. Files
     # are published only after the optimizer step completes; disabled by default.
@@ -496,6 +508,10 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     recompute_kv_cache_after_weight_updates: bool = False
     # Min ready groups the streaming trainer waits for before dispatching a batch.
     min_groups_for_streaming_train: int = 32
+    # Time-limited first step after (re)start; off by default.
+    first_step_partial: FirstStepPartialConfig = Field(
+        default_factory=FirstStepPartialConfig
+    )
     # Cap on in-flight generate_and_push calls in the rollout pump.
     max_inflight_prompts: int = 32
     # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
@@ -1393,6 +1409,25 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             raise ValueError(
                 "the ready_first sampler requires "
                 "loss_fn.force_on_policy_ratio=false so prev_logprobs are used"
+            )
+
+    partial_cfg = async_config.first_step_partial
+    if partial_cfg.timeout_s is not None:
+        # Only ready_first keeps the short step's leftover groups selectable by later
+        # steps; the other samplers stamp or evict them. PPO critic needs a full batch.
+        if is_ppo_run(master_config) or not isinstance(
+            async_config.sampler, ReadyFirstSamplerConfig
+        ):
+            raise ValueError(
+                "async_rl.first_step_partial requires GRPO with "
+                "async_rl.sampler.name=ready_first; got "
+                f"sampler={async_config.sampler.name!r}, "
+                f"ppo={is_ppo_run(master_config)}."
+            )
+        if partial_cfg.min_groups > algo_cfg.num_prompts_per_step:
+            raise ValueError(
+                f"async_rl.first_step_partial.min_groups ({partial_cfg.min_groups}) "
+                f"must be <= num_prompts_per_step ({algo_cfg.num_prompts_per_step})."
             )
 
     # Top-k retention keys off checkpointing.metric_name, but SC has no

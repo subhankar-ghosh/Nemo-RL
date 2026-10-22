@@ -19,7 +19,7 @@ import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
-from typing import Any, Callable, Optional, TypeVar, cast
+from typing import Any, Callable, Literal, Optional, TypeVar, cast
 
 import numpy as np
 import ray
@@ -379,6 +379,10 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Legacy async config block; SC reads its async knobs from `async_rl` instead.
     async_grpo: AsyncGRPOConfig | None = Field(default_factory=AsyncGRPOConfig)
     overlong_filtering: bool = False
+    # LOCAL PATCH: rows the overlong clamp truncates or the Gym agent aborted. "zero_weight" drops
+    # them from the loss; "penalize" keeps full weight and sets reward to overlong_abort_penalty_reward.
+    overlong_abort_treatment: Literal["zero_weight", "penalize"] = "zero_weight"
+    overlong_abort_penalty_reward: float = 0.0
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
     use_dynamic_sampling: bool = False
@@ -2667,13 +2671,21 @@ def _mtp_scaled_metrics(train_results, master_config: Any) -> dict[str, Any]:
     return out
 
 
-from nemo_rl.algorithms.truncation_abort import apply_truncation_abort_clamp
+from nemo_rl.algorithms.truncation_abort import (
+    aborted_row_indices,
+    apply_truncation_abort_clamp,
+)
+
+
+def _row_token_count(row: Any) -> int:
+    return sum(int(m["token_ids"].shape[-1]) for m in row if "token_ids" in m)
 
 
 def _clamp_overlong_sequences(
     repeated_batch: BatchedDataDict[DatumSpec],
     bin_capacity: int,
     round_to: int = 1,
+    zero_weight: bool = True,
 ) -> tuple[int, list[int]]:
     """LOCAL PATCH: zero-weight AND truncate rows longer than the packer bin. See status S3.24.
 
@@ -2689,14 +2701,13 @@ def _clamp_overlong_sequences(
     loss_multiplier = repeated_batch["loss_multiplier"].clone()
     clamped: list[int] = []
     for i, row in enumerate(logs):
-        total = sum(
-            int(m["token_ids"].shape[-1]) for m in row if "token_ids" in m
-        )
+        total = _row_token_count(row)
         if total <= target:
             continue
         clamped.append(i)
         # Do NOT assume the row was already zero-weighted: overlong_filtering never flagged it.
-        loss_multiplier[i] = 0
+        if zero_weight:
+            loss_multiplier[i] = 0
         excess = total - target
         for m in reversed(row):  # trim from the tail
             if excess <= 0:
@@ -2715,22 +2726,76 @@ def _clamp_overlong_sequences(
     return len(clamped), clamped
 
 
+def _overlong_clamp_bin(policy_cfg: Any) -> tuple[int, int]:
+    """LOCAL PATCH: (bin capacity, round_to) the clamp targets. Shared with SC. See S3.24."""
+    # Both packer bins are max_total_sequence_length x their batch size; take the smaller.
+    # logprob_batch_size is optional on main; without it only the train packer bin applies.
+    train_mbs = int(policy_cfg["train_micro_batch_size"])
+    per_bin = min(int(policy_cfg.get("logprob_batch_size", train_mbs)), train_mbs)
+    bin_cap = int(policy_cfg["max_total_sequence_length"]) * per_bin
+    return bin_cap, int(policy_cfg["make_sequence_length_divisible_by"])
+
+
+def _overlong_abort_penalty(algo_cfg: Any) -> Optional[float]:
+    """LOCAL PATCH: None in zero_weight mode (default), else the reward penalized rows get."""
+    # getattr: PPOConfig and test namespaces have no such field.
+    if getattr(algo_cfg, "overlong_abort_treatment", "zero_weight") == "zero_weight":
+        return None
+    return float(algo_cfg.overlong_abort_penalty_reward)
+
+
+def _apply_overlong_abort_penalty(
+    repeated_batch: BatchedDataDict[DatumSpec], master_config: Any
+) -> None:
+    """LOCAL PATCH: penalize mode -- overwrite the reward of rows the clamp/abort will hit.
+
+    Must run before baselines/advantages; the clamp itself still runs later.
+    """
+    penalty = _overlong_abort_penalty(master_config.grpo)
+    if penalty is None:
+        return
+    bin_cap, round_to = _overlong_clamp_bin(master_config.policy)
+    target = bin_cap - max(round_to, 1)  # same threshold as _clamp_overlong_sequences
+    rows = {
+        i
+        for i, row in enumerate(repeated_batch["message_log"])
+        if _row_token_count(row) > target
+    }
+    rows.update(aborted_row_indices(repeated_batch))
+    if rows:
+        reward = repeated_batch["total_reward"].clone()
+        reward[torch.as_tensor(sorted(rows), dtype=torch.long)] = penalty
+        repeated_batch["total_reward"] = reward
+
+
 def _overlong_clamp_metrics(
     repeated_batch: BatchedDataDict[DatumSpec], master_config: Any
 ) -> dict[str, Any]:
     """LOCAL PATCH: run the clamp and return its metrics. Called at both sites. See S3.24."""
-    policy_cfg = master_config.policy
-    # Both packer bins are max_total_sequence_length x their batch size; take the smaller.
-    per_bin = min(
-        int(policy_cfg["logprob_batch_size"]), int(policy_cfg["train_micro_batch_size"])
+    bin_cap, round_to = _overlong_clamp_bin(master_config.policy)
+    zero_weight = _overlong_abort_penalty(master_config.grpo) is None
+    _, clamped_idx = _clamp_overlong_sequences(
+        repeated_batch, bin_cap, round_to, zero_weight=zero_weight
     )
-    bin_cap = int(policy_cfg["max_total_sequence_length"]) * per_bin
-    round_to = int(policy_cfg["make_sequence_length_divisible_by"])
-    num_clamped, clamped_idx = _clamp_overlong_sequences(
-        repeated_batch, bin_cap, round_to
+    return _overlong_clamp_summary(
+        repeated_batch,
+        clamped_idx,
+        n_rows=len(repeated_batch["message_log"]),
+        group_size=int(master_config.grpo.num_generations_per_prompt),
+        zero_weight=zero_weight,
     )
-    n_rows = len(repeated_batch["message_log"])
-    group_size = int(master_config.grpo.num_generations_per_prompt)
+
+
+def _overlong_clamp_summary(
+    repeated_batch: Any,
+    clamped_idx: list[int],
+    *,
+    n_rows: int,
+    group_size: int,
+    zero_weight: bool = True,
+) -> dict[str, Any]:
+    """LOCAL PATCH: clamp + truncation-abort metrics. SC calls this per step. See S3.24/S3.25."""
+    num_clamped = len(clamped_idx)
     out: dict[str, Any] = {
         "num_overlong_clamped": num_clamped,
         "overlong_clamp_rate": (num_clamped / n_rows) if n_rows else 0.0,
@@ -2744,8 +2809,12 @@ def _overlong_clamp_metrics(
     # GRPO as uniformly wrong. These three make that observable. See status S3.25.
     # Agent-side truncation aborts clamp identically; fold them into the dead-row mask so
     # effective_pct_mixed reflects BOTH mechanisms. Their own counters stay separate.
-    abort_idx, abort_metrics = apply_truncation_abort_clamp(repeated_batch, group_size)
+    abort_idx, abort_metrics = apply_truncation_abort_clamp(
+        repeated_batch, group_size, zero_weight=zero_weight
+    )
     out.update(abort_metrics)
+    if not zero_weight:  # penalize mode: these rows keep weight, so none are dead
+        out["num_overlong_abort_penalized"] = len(set(clamped_idx) | set(abort_idx))
     rew = repeated_batch["total_reward"]
     if not torch.is_tensor(rew):
         rew = torch.as_tensor(rew)
@@ -2754,8 +2823,8 @@ def _overlong_clamp_metrics(
         mask = torch.zeros(n_rows, dtype=torch.bool)
         if clamped_idx:
             mask[torch.as_tensor(clamped_idx, dtype=torch.long)] = True
-        dead = mask.clone()
-        if abort_idx:
+        dead = mask.clone() if zero_weight else torch.zeros_like(mask)
+        if abort_idx and zero_weight:
             dead[torch.as_tensor(abort_idx, dtype=torch.long)] = True
         out["overlong_clamped_reward_mean"] = (
             rew[mask].mean().item() if bool(mask.any()) else float("nan")
@@ -2768,7 +2837,10 @@ def _overlong_clamp_metrics(
         for g in range(n_rows // group_size):
             s = slice(g * group_size, (g + 1) * group_size)
             kept = rew[s][~dead[s]]
-            mixed.append(0 < kept.sum().item() < kept.numel())
+            if zero_weight:
+                mixed.append(0 < kept.sum().item() < kept.numel())
+            else:  # a negative penalty breaks the 0/1 sum test
+                mixed.append(kept.numel() > 0 and kept.max().item() > kept.min().item())
         out["effective_pct_mixed"] = 100 * sum(mixed) / max(len(mixed), 1)
     return out
 
@@ -3698,6 +3770,8 @@ def _grpo_train_impl(
                     repeated_batch = apply_reward_shaping(
                         repeated_batch, master_config.grpo.reward_shaping
                     )
+                # LOCAL PATCH: penalize mode rewrites total_reward before baselines.
+                _apply_overlong_abort_penalty(repeated_batch, master_config)
 
                 # Calculate rewards & advantages
                 memory_tracker.snapshot_start_of_stage("Processing rewards", dir())
@@ -5672,6 +5746,8 @@ def async_grpo_train(
                             f"groups account for {prompt_ids_for_adv.shape[0]}"
                         )
 
+                    # LOCAL PATCH: penalize mode rewrites total_reward before advantages.
+                    _apply_overlong_abort_penalty(repeated_batch, master_config)
                     rewards = repeated_batch["total_reward"]
 
                     print(

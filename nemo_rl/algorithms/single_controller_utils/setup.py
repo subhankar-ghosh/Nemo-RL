@@ -54,6 +54,8 @@ from nemo_rl.algorithms.grpo import (
     RewardPenaltyConfig,
     _get_effort_config,
     _get_grpo_save_state,
+    _overlong_abort_penalty,
+    _overlong_clamp_bin,
 )
 from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
 from nemo_rl.algorithms.loss import ClippedPGLossFn
@@ -1043,6 +1045,22 @@ def _load_opd_full_teacher_lm_heads(
         )
 
 
+_OVERLONG_CLAMP_KEYS = (
+    "train_micro_batch_size",
+    "max_total_sequence_length",
+    "make_sequence_length_divisible_by",
+)
+
+
+def _sc_overlong_clamp_bin(policy_config: Any) -> Optional[tuple[int, int]]:
+    """LOCAL PATCH: the clamp bin, or None (clamp off, with a warning) if the bin keys are missing."""
+    missing = [key for key in _OVERLONG_CLAMP_KEYS if key not in policy_config]
+    if missing:
+        print(f"WARNING: overlong clamp disabled; policy config lacks {missing}", flush=True)
+        return None
+    return _overlong_clamp_bin(policy_config)
+
+
 def setup_single_controller(
     master_config: MasterConfig,
     tokenizer: PreTrainedTokenizerBase,
@@ -2030,6 +2048,9 @@ def setup_single_controller(
         staging_partition_id=(
             token_capture_cfg.staging_partition if token_capture_cfg.enabled else None
         ),
+        # LOCAL PATCH: same overlong clamp as the classic loop. S3.24.
+        overlong_clamp_bin=_sc_overlong_clamp_bin(policy_config),
+        overlong_abort_penalty_reward=_overlong_abort_penalty(algo_cfg),
     )
     finalizer_actors: list[Any] = []
     if token_capture_cfg.enabled:

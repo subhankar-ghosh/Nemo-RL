@@ -83,6 +83,8 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
     num_prompts_per_step * num_generations_per_prompt == value.train_global_batch_size  # PPO
     ```
 
+    One opt-in exception (GRPO with the `ready_first` sampler only): with `async_rl.first_step_partial.timeout_s` set, the first step after the process (re)starts closes on the groups it has trained once `timeout_s` seconds have passed and at least `min_groups` groups were trained. It is still one optimizer step, normalized over the tokens it trained on. The unused groups go to later steps. The step logs `partial_step` and `step_num_groups`.
+
 4. **Enable importance sampling correction** whenever the sampler admits off-policy data (any `max_staleness_versions > 0` on the `windowed`/`weight_fifo` samplers, or `max_lookahead_versions > 0` on `in_order`). The correction and its derivation are the same as for legacy async GRPO — see [Why Importance Sampling Correction Is Required for Async](./async-grpo.md#why-importance-sampling-correction-is-required-for-async):
 
     ```yaml

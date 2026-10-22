@@ -44,6 +44,10 @@ import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
+from nemo_rl.algorithms.truncation_abort import (
+    ROW_CLAMP_RECORD_KEY,
+    clamp_prompt_group,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import (
@@ -1111,11 +1115,17 @@ class TQReplayBuffer:
         include_message_violation_fields: bool,
         staging_partition_id: Optional[str] = None,
         require_routed_experts: bool = False,
+        overlong_clamp_bin: Optional[tuple[int, int]] = None,
+        overlong_abort_penalty_reward: Optional[float] = None,
     ):
         self._dp_client = dp_client
         self._partition_id = partition_id
         self._pad_value_dict = dict(pad_value_dict)
         self._include_message_violation_fields = include_message_violation_fields
+        # LOCAL PATCH: (bin capacity, round_to) for the overlong clamp; None disables it. S3.24.
+        self._overlong_clamp_bin = overlong_clamp_bin
+        # LOCAL PATCH: None = zero-weight clamped/aborted rows; a float = penalize mode.
+        self._overlong_abort_penalty_reward = overlong_abort_penalty_reward
         # Token-capture mode only: the staging partition whose per-call delta
         # rows `remove` must clear alongside the canonical rows. None on the
         # legacy path.
@@ -1247,11 +1257,24 @@ class TQReplayBuffer:
                 "TQReplayBuffer must be bound to the controller data-plane "
                 "checkpoint barrier before committing samples"
             )
+        row_weight = None
+        if self._overlong_clamp_bin is not None:
+            # LOCAL PATCH: rows over the packer bin abort the train step; clamp + zero-weight
+            # them, and zero agent-aborted rows, like grpo._overlong_clamp_metrics. S3.24/S3.26.
+            # Penalize mode rewrites Completion.reward here, before total_reward is tensorized.
+            row_weight, row_record = clamp_prompt_group(
+                record,
+                *self._overlong_clamp_bin,
+                penalty_reward=self._overlong_abort_penalty_reward,
+            )
+            record.rollout_metrics[ROW_CLAMP_RECORD_KEY] = row_record
         train_batch = record_to_train_batch(
             record,
             pad_value_dict=self._pad_value_dict,
             include_message_violation_fields=self._include_message_violation_fields,
         )
+        if row_weight is not None:
+            train_batch["sample_mask"] = train_batch["sample_mask"] * row_weight
         sample_ids, fields, tags = pack_payload(
             train_batch,
             weight_version=start_weight_version,

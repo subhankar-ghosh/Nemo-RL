@@ -61,6 +61,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     AsyncRLConfig,
+    FirstStepPartialConfig,
     MasterConfig,
 )
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
@@ -2109,6 +2110,153 @@ def test_train_pump_prunes_stamps_older_than_the_step_that_just_closed(
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
     assert ctrl._batch_shortfall == {5: 1}
+
+
+class _VersionedChunkSampler(_EmptySampler):
+    """Yields scripted chunk sizes per trainer version, then starves (rollouts still running)."""
+
+    def __init__(self, chunks_by_version: dict[int, list[int]]) -> None:
+        self._chunks = {v: list(c) for v, c in chunks_by_version.items()}
+
+    async def select(self, **kwargs):
+        BaseSampler._validate_group_bounds(
+            kwargs["min_prompt_groups"], kwargs["max_prompt_groups"]
+        )
+        version = kwargs["current_train_weight"]
+        pending = self._chunks.get(version, [])
+        if not pending:
+            return None, 0
+        num_groups = pending.pop(0)
+        assert num_groups <= kwargs["max_prompt_groups"]
+        meta = KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"v{version}-{len(pending)}"],
+            fields=[],
+            sequence_lengths=[1],
+            tags=_one_group_tags(1, weight_version=0),
+        )
+        return meta, num_groups
+
+
+class _StepCountingTrainer(_NoOpTrainer):
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def begin_train_step(self, loss_fn) -> None:
+        del loss_fn
+        self.calls.append("begin")
+
+    def train_microbatches_from_meta(
+        self, meta: KVBatchMeta, *, train_fields: tuple[str, ...]
+    ) -> None:
+        del meta, train_fields
+        self.calls.append("train")
+
+    def finish_train_step(self) -> dict:
+        self.calls.append("finish")
+        return {}
+
+
+def _first_step_partial_controller(
+    monkeypatch, chunks_by_version, *, max_num_steps=2, partial=None
+):
+    ctrl = _train_pump_controller(sampler=_VersionedChunkSampler(chunks_by_version))
+    ctrl._master_config.grpo = GRPOConfig.model_construct(
+        num_prompts_per_step=4, max_num_steps=max_num_steps
+    )
+    ctrl._algo_cfg = ctrl._master_config.grpo
+    if partial is not None:
+        ctrl._async_cfg.first_step_partial = partial
+    ctrl._buffer_capacity = asyncio.Semaphore(0)
+    ctrl._trainer = _StepCountingTrainer()
+    ctrl._rollout_exhausted.clear()
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+    return ctrl
+
+
+def _train_step_metrics(ctrl) -> list[dict]:
+    return [
+        c.args[0]
+        for c in ctrl._logger.log_metrics.call_args_list
+        if c.kwargs.get("prefix") == "train"
+    ]
+
+
+def test_first_step_partial_closes_first_step_short_then_trains_full(
+    monkeypatch,
+) -> None:
+    """Step 1 closes on its 2 trained groups after the timeout; step 2 takes a full 4."""
+    ctrl = _first_step_partial_controller(
+        monkeypatch,
+        {0: [2], 1: [2, 2]},
+        partial=FirstStepPartialConfig(timeout_s=0.05, min_groups=2),
+    )
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
+
+    # Exactly one optimizer step per RL step; the short one fed only its own chunk.
+    assert ctrl._trainer.calls == [
+        "begin", "train", "finish", "begin", "train", "train", "finish",
+    ]  # fmt: skip
+    assert ctrl._train_steps == 2
+    assert ctrl._trainer_version == 2
+    assert ctrl._sync_weights.await_count == 2
+    # Consumed counts and buffer permits follow what was trained, not the target.
+    assert ctrl._consumed_samples == 6
+    assert ctrl._buffer_capacity._value == 6
+    metrics = _train_step_metrics(ctrl)
+    assert [(m["partial_step"], m["step_num_groups"]) for m in metrics] == [
+        (1, 2),
+        (0, 4),
+    ]
+
+
+def test_first_step_partial_waits_for_min_groups(monkeypatch) -> None:
+    """Past the timeout but below min_groups, the step keeps waiting."""
+    ctrl = _first_step_partial_controller(
+        monkeypatch,
+        {0: [2]},
+        partial=FirstStepPartialConfig(timeout_s=0.01, min_groups=3),
+    )
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=0.5))
+    assert ctrl._train_steps == 0
+    assert ctrl._trainer.calls == ["begin", "train"]
+
+
+def test_first_step_partial_applies_to_the_first_step_only(monkeypatch) -> None:
+    """A later starved step never closes short, however long it waits."""
+    ctrl = _first_step_partial_controller(
+        monkeypatch,
+        {0: [2], 1: [2]},
+        partial=FirstStepPartialConfig(timeout_s=0.01, min_groups=2),
+    )
+
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=0.5))
+    assert ctrl._train_steps == 1
+    assert ctrl._consumed_samples == 2
+
+
+@pytest.mark.parametrize("partial", [None, FirstStepPartialConfig()])
+def test_first_step_partial_off_keeps_full_steps(monkeypatch, partial) -> None:
+    """Absent or timeout_s=None: a starved first step waits, and no new metrics appear."""
+    ctrl = _first_step_partial_controller(monkeypatch, {0: [2]}, partial=partial)
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=0.3))
+    assert ctrl._train_steps == 0
+
+    ctrl = _first_step_partial_controller(
+        monkeypatch, {0: [2, 2]}, max_num_steps=1, partial=partial
+    )
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
+    assert ctrl._consumed_samples == 4
+    (metrics,) = _train_step_metrics(ctrl)
+    assert "partial_step" not in metrics and "step_num_groups" not in metrics
 
 
 @pytest.mark.parametrize(

@@ -123,6 +123,9 @@ class RewardPartial:
 
     weighted_total: float
     weight: float
+    # Unmasked sum and row count, for the classic grpo.py ``reward`` semantics.
+    total: float = 0.0
+    count: int = 0
 
     @classmethod
     def from_rows(
@@ -136,15 +139,20 @@ class RewardPartial:
         plain mean and callers that never had a mask keep their old numbers.
         """
         flat = rewards.flatten()
+        total = float(flat.sum(dtype=torch.float64))
         if sample_mask is None:
             return cls(
-                weighted_total=float(flat.sum(dtype=torch.float64)),
+                weighted_total=total,
                 weight=float(flat.numel()),
+                total=total,
+                count=flat.numel(),
             )
         mask = sample_mask.flatten().to(flat.dtype)
         return cls(
             weighted_total=float((flat * mask).sum(dtype=torch.float64)),
             weight=float(mask.sum(dtype=torch.float64)),
+            total=total,
+            count=flat.numel(),
         )
 
 
@@ -197,6 +205,7 @@ def reduce_advantage_pump_metrics(
             placeholders and mask_sample/overlong/seq-logprob-error rows carry
             0), so ``reward`` averages over trained rows only, matching what
             the advantage estimator's baseline already excludes.
+            ``reward_all_rows`` is the unmasked mean over every row.
         advantage_partials: One record per advantage_stage call, over that
             call's token-masked advantages.
         sequence_lengths: All input_lengths trained on this step.
@@ -221,6 +230,11 @@ def reduce_advantage_pump_metrics(
             sum(partial.weighted_total for partial in reward_partials) / weight
             if weight > 0
             else 0.0
+        )
+        # Every row, zero-weight ones included: comparable with classic ``reward``.
+        count = sum(partial.count for partial in reward_partials)
+        out["reward_all_rows"] = (
+            sum(partial.total for partial in reward_partials) / count if count else 0.0
         )
     if advantage_partials:
         # A call whose mask selected nothing carries no min or max to merge.

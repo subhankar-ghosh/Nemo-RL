@@ -70,6 +70,7 @@ from nemo_rl.algorithms.single_controller_utils import (
     setup_single_controller,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
+    FirstStepPartialConfig,
     RolloutCheckpointConfig,
     TokenCaptureConfig,
     _validate_opd_full_config,
@@ -3311,3 +3312,57 @@ def test_minf_image_preprocessing_emits_float32_pixels():
     assert tuple(imgs.shape) == (1, 4, 3 * 2 * 2)
     assert imgs_sizes.dtype == torch.int32
     assert imgs_sizes.tolist() == [[4, 4]]
+
+
+def _first_step_partial_config(sampler_cfg=None, **partial) -> MasterConfig:
+    mc = _make_master_config(
+        sampler_cfg=sampler_cfg,
+        loss_cfg=ClippedPGLossConfig(use_importance_sampling_correction=True),
+    )
+    mc.async_rl = mc.async_rl.model_copy(
+        update={"first_step_partial": FirstStepPartialConfig(**partial)}
+    )
+    return mc
+
+
+def test_first_step_partial_is_off_by_default():
+    assert AsyncRLConfig().first_step_partial.timeout_s is None
+    # Off: any sampler validates, as before the knob existed.
+    validate_single_controller_config(_first_step_partial_config())
+
+
+def test_first_step_partial_accepts_ready_first_grpo():
+    validate_single_controller_config(
+        _first_step_partial_config(
+            ReadyFirstSamplerConfig(max_staleness_versions=1),
+            timeout_s=600,
+            min_groups=2,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("sampler_cfg", "min_groups", "match"),
+    [
+        (None, 2, "requires GRPO with async_rl.sampler.name=ready_first"),
+        (
+            WindowedSamplerConfig(max_staleness_versions=1),
+            2,
+            "requires GRPO with async_rl.sampler.name=ready_first",
+        ),
+        (ReadyFirstSamplerConfig(max_staleness_versions=1), 5, "must be <= num_prompts"),
+    ],
+    ids=["in_order", "windowed", "min_groups_above_step"],
+)
+def test_first_step_partial_rejects_unsupported(sampler_cfg, min_groups, match):
+    mc = _first_step_partial_config(sampler_cfg, timeout_s=600, min_groups=min_groups)
+    with pytest.raises(ValueError, match=match):
+        validate_single_controller_config(mc)
+
+
+@pytest.mark.parametrize(
+    "bad", [{"timeout_s": 0}, {"min_groups": 0}, {"timeout": 600}]
+)
+def test_first_step_partial_config_rejects_bad_values(bad):
+    with pytest.raises(ValueError):
+        FirstStepPartialConfig(**bad)

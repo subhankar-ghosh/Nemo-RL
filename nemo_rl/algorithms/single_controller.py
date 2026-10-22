@@ -95,6 +95,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 )
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
+    _mtp_scaled_metrics,
     _write_latest_checkpoint_status,
     aggregate_rollout_metrics,
 )
@@ -139,6 +140,10 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
 from nemo_rl.algorithms.single_controller_utils.utils import (
     aggregate_step_metrics,
     reduce_advantage_pump_metrics,
+)
+from nemo_rl.algorithms.truncation_abort import (
+    ROW_CLAMP_RECORD_KEY,
+    step_clamp_metrics,
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
@@ -2813,6 +2818,12 @@ class SingleControllerActor:
             )
         return target
 
+    def _first_step_partial_cfg(self) -> Optional[Any]:
+        """The async_rl.first_step_partial block when enabled, else None."""
+        # getattr: test doubles build _async_cfg without this block.
+        cfg = getattr(self._async_cfg, "first_step_partial", None)
+        return cfg if cfg is not None and cfg.timeout_s is not None else None
+
     def _streaming_ppo_selection_kwargs(self) -> dict[str, int]:
         """Derive aligned chunks and the tail floor without changing other samplers.
 
@@ -2924,8 +2935,16 @@ class SingleControllerActor:
             self._algo_cfg.policy_training_start_step if self._is_ppo else 0
         )
         selection_kwargs = self._streaming_ppo_selection_kwargs()
+        # The first step of this process may close short after a timeout; later ones never.
+        partial_cfg = self._first_step_partial_cfg()
+        partial_pending = partial_cfg is not None
 
         while self._train_steps < self._algo_cfg.max_num_steps:
+            partial_deadline = (
+                time.monotonic() + partial_cfg.timeout_s if partial_pending else None
+            )
+            partial_pending = False
+            partial_step = False
             maybe_gpu_profile_step(self._trainer, self._train_steps + 1)
             if self._gen is not self._trainer and isinstance(
                 self._gen, (VllmGeneration, MegatronGeneration)
@@ -3088,6 +3107,22 @@ class SingleControllerActor:
                                     f"groups with {buffered_groups} group(s) "
                                     f"remaining in the buffer"
                                 )
+                            # first_step_partial: close on the trained groups; unconsumed
+                            # ones stay in the buffer for later steps.
+                            if (
+                                partial_deadline is not None
+                                and step_open
+                                and groups_dispatched >= partial_cfg.min_groups
+                                and time.monotonic() >= partial_deadline
+                            ):
+                                partial_step = True
+                                print(
+                                    f"  first step closing short on {groups_dispatched}/"
+                                    f"{target_groups} prompt groups after "
+                                    f"{partial_cfg.timeout_s}s (first_step_partial)",
+                                    flush=True,
+                                )
+                                break
                             # Safe to span the select: a starved poll never
                             # reaches the data plane, so nothing below is
                             # counted twice.
@@ -3571,6 +3606,10 @@ class SingleControllerActor:
                 step_metrics = {}
                 if policy_result is not None:
                     step_metrics.update(aggregate_step_metrics(policy_result))
+                    # LOCAL PATCH: scaled MTP loss beside the raw one. See S3.27/S3.28.
+                    step_metrics.update(
+                        _mtp_scaled_metrics(policy_result, self._master_config)
+                    )
                 if value_result is not None:
                     step_metrics.update(_compute_critic_metrics(value_result))
                 async with self._data_plane_checkpoint_barrier.mutation(
@@ -3602,6 +3641,17 @@ class SingleControllerActor:
                         per_group_rollout_metrics.setdefault(metric_name, []).append(
                             value
                         )
+                # LOCAL PATCH: per-row clamp/abort records from commit -> step metrics. S3.24.
+                row_clamp_records = per_group_rollout_metrics.pop(
+                    ROW_CLAMP_RECORD_KEY, None
+                )
+                if row_clamp_records:
+                    step_metrics.update(
+                        step_clamp_metrics(
+                            row_clamp_records,
+                            self._algo_cfg.num_generations_per_prompt,
+                        )
+                    )
                 step_metrics.update(
                     aggregate_rollout_metrics(per_group_rollout_metrics)
                 )
@@ -3770,6 +3820,9 @@ class SingleControllerActor:
                         "promoted_prompt_groups": promoted_prompt_groups,
                     }
                 )
+                if partial_cfg is not None:
+                    step_metrics["partial_step"] = int(partial_step)
+                    step_metrics["step_num_groups"] = groups_dispatched
 
                 # Checkpointing (mirrors async_grpo_train's save block).
                 if will_save_checkpoint:

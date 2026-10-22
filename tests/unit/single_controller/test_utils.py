@@ -186,6 +186,33 @@ class TestReduceAdvantagePumpMetrics:
 
         assert split == pytest.approx(whole)
         assert whole["reward"] == pytest.approx(13.0 / 3.0)
+        assert whole["reward_all_rows"] == pytest.approx(4.0)
+
+    def test_reward_all_rows_ignores_sample_mask(self) -> None:
+        # Zero-weight rows (clamped/aborted failures) drop out of reward only.
+        rewards = torch.tensor([1.0, 0.0, 0.0, 1.0])
+        masks = torch.tensor([1.0, 0.0, 0.0, 1.0])
+        out = reduce_advantage_pump_metrics(
+            reward_partials=[
+                RewardPartial.from_rows(rewards[:2], masks[:2]),
+                RewardPartial.from_rows(rewards[2:], masks[2:]),
+            ],
+            advantage_partials=[],
+            sequence_lengths=[],
+        )
+        assert out["reward"] == pytest.approx(1.0)
+        assert out["reward_all_rows"] == pytest.approx(0.5)
+
+    def test_reward_all_rows_with_every_row_masked(self) -> None:
+        out = reduce_advantage_pump_metrics(
+            reward_partials=[
+                RewardPartial.from_rows(torch.tensor([0.0, 1.0]), torch.zeros(2))
+            ],
+            advantage_partials=[],
+            sequence_lengths=[],
+        )
+        assert out["reward"] == 0.0
+        assert out["reward_all_rows"] == pytest.approx(0.5)
 
     def test_empty_partial_does_not_skew_merged_advantages(self) -> None:
         out = reduce_advantage_pump_metrics(

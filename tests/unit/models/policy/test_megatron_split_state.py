@@ -803,6 +803,30 @@ class TestFinish:
         arg = w.model.scale_gradients.call_args.args[0]
         assert arg == pytest.approx(1.0 / 8.0, rel=1e-4)
 
+    @pytest.mark.parametrize("num_chunks", [1, 2, 4])
+    def test_short_step_normalizes_by_its_own_chunks(
+        self, mock_module_symbols, num_chunks
+    ):
+        """A step closed early (first_step_partial) equals a smaller batch.
+
+        N is the valid-token count of the chunks actually fed, never the
+        configured train_global_batch_size; the LR schedule still advances one step.
+        """
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        w.begin_train_step(loss_fn=w._test_loss_fn)
+        for _ in range(num_chunks):
+            w.train_microbatch(_fake_batch())  # 8 samples x 256 valid tokens
+        w.finish_train_step()
+
+        arg = w.model.scale_gradients.call_args.args[0]
+        assert arg == pytest.approx(1.0 / (num_chunks * 2048.0), rel=1e-6)
+        w.optimizer.step.assert_called_once()
+        w.scheduler.step.assert_called_once_with(
+            increment=w.cfg["train_global_batch_size"]
+        )
+
     @pytest.mark.parametrize("token_level_loss", [False, True])
     @pytest.mark.parametrize("draft_loss_weight", [0.0, 0.5, 1.0])
     def test_draft_uses_independent_denominator_and_existing_reduce(
