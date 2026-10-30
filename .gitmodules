@@ -11,5 +11,5 @@
 [submodule "3rdparty/Gym-workspace/Gym"]
 	path = 3rdparty/Gym-workspace/Gym
 	url = https://github.com/subhankar-ghosh/Gym.git
-	branch = dabstep-patches
+	branch = dabstep-patches-4930
 	shallow = true
