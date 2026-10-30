@@ -179,3 +179,47 @@ def test_score_centering_masks_nonfinite_positions_and_keeps_icepop_correction(
         # zero, but the head/tail correction still supplies a gradient.
         assert token_lp.grad[0, 0] == 0
         assert head_lp.grad[0, 0].abs().sum() > 0
+
+
+def test_score_centering_prefix_window_row_matches_full_row():
+    """A window row (prefix of the chain, mask trimmed to its turns) keeps top-k aligned."""
+    from nemo_rl.algorithms.loss.interfaces import LossInputType
+    from nemo_rl.algorithms.loss.loss_input import prepare_loss_input
+
+    torch.manual_seed(7)
+    seq_len, window_len, vocab, k = 10, 6, 11, 3
+    logits = torch.randn(1, seq_len, vocab, requires_grad=True)
+    ids = torch.stack([torch.randperm(vocab)[:k] for _ in range(seq_len)]).unsqueeze(0)
+    sampler_logprobs = torch.log_softmax(torch.randn(1, seq_len, vocab), -1).gather(
+        -1, ids
+    )
+    # This window trains on tokens 3..5 only; later tokens are cut off.
+    window_mask = torch.zeros(1, seq_len)
+    window_mask[0, 3:window_len] = 1.0
+    loss_fn = SimpleNamespace(input_type=LossInputType.LOGPROB, score_centering=True)
+
+    def per_token_term(length):
+        data = BatchedDataDict(
+            {
+                "input_ids": ids[:, :length, 0],
+                "sampler_topk_token_ids": ids[:, :length],
+                "sampler_topk_logprobs": sampler_logprobs[:, :length],
+            }
+        )
+        prepared, _ = prepare_loss_input(logits[:, :length], data, loss_fn)
+        term, _ = compute_score_centering_term(
+            prepared["policy_logprobs_at_sampler_topk"],
+            sampler_topk_logprobs=sampler_logprobs[:, 1:length],
+            importance_sampling_mode="tis",
+            is_bounds=(0.0, 2.0),
+            token_mask=window_mask[:, 1:length],
+        )
+        return term
+
+    full, window = per_token_term(seq_len), per_token_term(window_len)
+    torch.testing.assert_close(window, full[:, : window_len - 1])
+    assert full[:, window_len - 1 :].abs().sum() == 0
+    torch.testing.assert_close(
+        torch.autograd.grad(window.sum(), logits)[0],
+        torch.autograd.grad(full.sum(), logits)[0],
+    )
